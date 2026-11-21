@@ -2,11 +2,16 @@
 //!
 //! Covers tokens, Boolean operations, map descriptions, and transfer. A listed
 //! cursor feeds transfer, so no backend's encoding shapes the expectations.
+//! Both stores exercise the same public partition and conditional contracts.
 
+use std::fmt::Debug;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
-use sra::backend::{BoolOp, Function, MapSpec, transfer};
+use sra::backend::{Algebra, Align, Backend, BoolOp, Function, Groups, MapSpec, Values, transfer};
+use sra::bdd::BddStore;
 use sra::scalar::ScalarSort;
+use sra::sparse::SparseStore;
 
 const BV4: ScalarSort = ScalarSort::bv(4);
 
@@ -270,4 +275,209 @@ fn a_transfer_image_outside_the_sort_is_rejected() {
         |_| panic!("filter received an invalid image"),
         true,
     );
+}
+
+#[track_caller]
+fn rejects<T: Debug>(expected: &str, build: impl FnOnce() -> T) {
+    let panic = catch_unwind(AssertUnwindSafe(build)).expect_err("invalid input was accepted");
+    let message = panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap();
+    assert!(message.contains(expected), "unexpected panic: {message}");
+}
+
+// --- refinement grouping ----
+
+#[test]
+fn grouping_preserves_selected_classes_and_forgets_declined_ones() {
+    let mut r = Groups::default();
+    // Class 2 is declined once. Accepted classes retain their groups.
+    let mut select = |class| class != 2;
+    r.group(0, 5, &mut select).unwrap().push(8);
+    assert!(r.group(2, 5, &mut select).is_none());
+    assert!(
+        r.group(2, 5, &mut |_| panic!(
+            "a declined class is never asked again"
+        ))
+        .is_none()
+    );
+    assert!(r.group(3, 6, &mut select).unwrap().is_empty());
+    assert_eq!(r.group(0, 9, &mut select).unwrap().as_slice(), [8]);
+    assert_eq!(r.reached(), 3);
+    assert!(
+        r.selected()
+            .map(|(class, initial, _)| (class, initial))
+            .eq([(0, 5), (3, 6)])
+    );
+
+    // The next call clears the lookup and reuses the existing buffers.
+    r.restart();
+    assert!(r.group(3, 0, &mut select).unwrap().is_empty());
+    assert_eq!(r.reached(), 1);
+    assert_eq!(r.selected().next().map(|(c, p, _)| (c, p)), Some((3, 0)));
+    for class in [0, 2] {
+        assert!(r.group(class, 0, &mut |_| true).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn refinement_restart_clears_classes_after_a_selector_panic() {
+    let mut r = Groups::default();
+    r.group(3, 5, &mut |_| true).unwrap().extend([8, 9]);
+    assert!(r.group(1, 5, &mut |_| false).is_none());
+    rejects("selector failed", || {
+        let _ = r.group(2, 5, &mut |_| panic!("selector failed"));
+    });
+
+    // Restart clears every class touched before the selector panicked.
+    r.restart();
+    assert_eq!(r.reached(), 0);
+    assert!(r.selected().next().is_none());
+    let mut asked = Vec::new();
+    let mut select = |class| {
+        asked.push(class);
+        true
+    };
+    assert!(r.group(1, 7, &mut select).unwrap().is_empty());
+    assert_eq!(r.selected().next().map(|(c, p, _)| (c, p)), Some((1, 7)));
+    assert_eq!(r.reached(), 1);
+
+    r.restart();
+    assert!(r.group(3, 9, &mut select).unwrap().is_empty());
+    assert_eq!(asked, [1, 3]);
+    assert_eq!(r.selected().next().map(|(c, p, _)| (c, p)), Some((3, 9)));
+}
+
+#[test]
+#[cfg(target_pointer_width = "32")]
+fn an_unrepresentable_class_leaves_grouping_reusable() {
+    let mut r = Groups::default();
+    r.group(1, 1, &mut |_| true).unwrap().push(8);
+    rejects("class lookup length exceeds usize", || {
+        let _ = r.group(u32::MAX, 0, &mut |_| true);
+    });
+    r.restart();
+    assert_eq!(r.reached(), 0);
+    assert!(r.group(1, 0, &mut |_| true).unwrap().is_empty());
+}
+
+// --- store-backed operations ----
+
+fn algebras(sort: ScalarSort, edges: usize) -> [Box<dyn Algebra>; 2] {
+    let bdd = Arc::new(BddStore::with_capacity(16, edges, 1));
+    let sparse = Arc::new(SparseStore::with_capacity(16, edges, 1));
+    [bdd.bind(sort).unwrap(), sparse.bind(sort).unwrap()]
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn conditionals_check_all_three_input_roots() {
+    for (alg, expected) in algebras(BV4, 32).into_iter().zip([
+        "cannot use an unreferenced BDD node",
+        "cannot use an unreferenced sparse node",
+    ]) {
+        let released = alg.set(&[1]);
+        alg.dec_ref(released);
+        rejects(expected, || {
+            alg.ite(released, Function::TRUE, Function::TRUE)
+        });
+        rejects(expected, || {
+            alg.ite(Function::FALSE, released, Function::TRUE)
+        });
+        rejects(expected, || {
+            alg.ite(Function::TRUE, Function::FALSE, released)
+        });
+    }
+}
+
+fn quotient_inputs() -> [(Box<dyn Algebra>, Function); 2] {
+    algebras(BV4, 32).map(|alg| {
+        let f = alg.values(
+            0,
+            &[1, 3, 5],
+            &[1, 2, 3],
+            &mut Vec::new(),
+            &mut Values::default(),
+        );
+        (alg, f)
+    })
+}
+
+#[test]
+fn quotient_merges_the_requested_classes() {
+    for (alg, f) in quotient_inputs() {
+        let mut scratch = Align::default();
+        let classes = [0, 1, 0, 2];
+        let q = alg.quotient(f, &classes, &mut scratch);
+        let again = alg.quotient(f, &classes, &mut scratch);
+        assert_eq!(again, q);
+        for x in 0..16 {
+            let expect = match x {
+                1 => 1,
+                5 => 2,
+                _ => 0,
+            };
+            assert_eq!(alg.evaluate(again, &[x]), expect, "at {x}");
+        }
+        for root in [f, q, again] {
+            alg.dec_ref(root);
+        }
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn quotient_rejects_invalid_class_maps() {
+    let count = "quotient must merge input classes and leave at least two result classes";
+    for (alg, f) in quotient_inputs() {
+        let mut scratch = Align::default();
+        for (classes, expect) in [
+            (&[0, 0, 0, 0][..], count),
+            (&[0, 1, 2, 3][..], count),
+            (
+                &[0, 2, 0, 1][..],
+                "quotient classes must be numbered in first-appearance order",
+            ),
+            (
+                &[0, 1, 2, 3, 3][..],
+                "there must be one quotient class per input class",
+            ),
+        ] {
+            rejects(expect, || alg.quotient(f, classes, &mut scratch));
+        }
+        alg.dec_ref(f);
+    }
+}
+
+#[test]
+fn an_overlapping_default_labeled_case_is_rejected() {
+    for alg in algebras(BV4, 32) {
+        let a = alg.set(&[1, 2, 3]);
+        let b = alg.set(&[3, 4]);
+        let mut labels = vec![77];
+        for cases in [[(a, 0), (b, 1)], [(b, 1), (a, 0)]] {
+            rejects("cases with different labels overlap", || {
+                alg.cases(0, &cases, &mut labels)
+            });
+            assert_eq!(labels, [77]);
+        }
+        alg.dec_ref(a);
+        alg.dec_ref(b);
+    }
+}
+
+#[test]
+fn values_append_only_reachable_labels_after_the_prefix() {
+    // The BDD store starts without edge slots, so interning the canonical
+    // branch forces a retry after both labels have been appended.
+    for alg in algebras(ScalarSort::bool(), 0) {
+        // Both keys are listed, so the default is unreachable.
+        let mut labels = vec![77];
+        let f = alg.values(9, &[0, 1], &[10, 20], &mut labels, &mut Default::default());
+        assert_eq!(labels, [77, 10, 20]);
+        assert_eq!([alg.evaluate(f, &[0]), alg.evaluate(f, &[1])], [0, 1]);
+        alg.dec_ref(f);
+    }
 }
