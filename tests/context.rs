@@ -160,6 +160,88 @@ fn creating_an_algebra_on_a_shared_context_is_rejected() {
     cx.bind("bdd", ScalarSort::bv(12));
 }
 
+// --- field binding ----
+
+#[test]
+fn selections_belong_to_individual_record_members() {
+    let mut cx = tiny();
+    let sorts = cx.sorts();
+    let members = [("x", sorts.bv(4)), ("x", sorts.bv(4))];
+    let pair = sorts.record("Pair", &members);
+    let a = sorts.project(pair, 0);
+    let b = sorts.project(pair, 1);
+    let other = sorts.project(sorts.record("Other", &members), 0);
+    assert_eq!(cx.algebra("bdd", BV4), None);
+    assert_eq!(cx.field(a), None);
+    let bdd = cx.bind_field(a, "bdd");
+    assert_eq!(cx.algebra("bdd", BV4), Some(bdd));
+    assert_eq!(cx.field(b), None);
+    assert_eq!(cx.field(other), None);
+    rejects("already bound to a different backend", || {
+        cx.bind_field(a, "sparse");
+    });
+    assert_eq!(cx.algebra("sparse", BV4), None);
+    let sparse = cx.bind_field(b, "sparse");
+    assert_ne!(bdd, sparse);
+    assert_eq!(cx.bind_field(other, "bdd"), bdd);
+
+    let p = cx.set(bdd, &[1, 3]);
+    let again = cx.sorts().record("Pair", &members);
+    assert_eq!(cx.bind_field(cx.sorts().project(again, 0), "bdd"), bdd);
+    assert_eq!(cx.field(b), Some(sparse));
+    assert!(p.contains(&[3]));
+}
+
+#[test]
+fn fields_require_local_scalar_record_projections() {
+    let mut cx = tiny();
+    let sorts = cx.sorts();
+    let a = sorts.bool();
+    let r = sorts.record("R", &[("a", a)]);
+    let nested = sorts.record("Nested", &[("r", r)]);
+    for decl in [
+        sorts.constructor(r),
+        sorts.project(nested, 0),
+        sorts.project(sorts.product([a, a]), 0),
+    ] {
+        let reason = "field must project a scalar record member";
+        rejects(reason, || {
+            cx.field(decl);
+        });
+        rejects(reason, || {
+            cx.bind_field(decl, "sparse");
+        });
+    }
+
+    let other = Context::empty();
+    let sorts = other.sorts();
+    let decl = sorts.project(sorts.record("R", &[("a", sorts.bool())]), 0);
+    let reason = "declaration belongs to another store";
+    rejects(reason, || {
+        cx.field(decl);
+    });
+    rejects(reason, || {
+        cx.bind_field(decl, "bdd");
+    });
+}
+
+#[test]
+fn a_new_field_needs_exclusive_access_even_when_its_algebra_exists() {
+    let mut cx = tiny();
+    let id = cx.bind("sparse", BV4);
+    let sorts = cx.sorts();
+    let field = sorts.project(sorts.record("R", &[("a", sorts.bv(4))]), 0);
+    let p = cx.t(id);
+    rejects("cannot change bindings on a shared context", || {
+        cx.bind_field(field, "sparse");
+    });
+    assert_eq!(cx.field(field), None);
+    drop(p);
+    assert_eq!(cx.bind_field(field, "sparse"), id);
+}
+
+// --- predicate operations ----
+
 #[test]
 fn constant_constructors_reject_a_foreign_algebra_before_returning() {
     let id = tiny().bind("bdd", BV4);
@@ -170,8 +252,6 @@ fn constant_constructors_reject_a_foreign_algebra_before_returning() {
     rejects(expected, || std::mem::forget(cx.t(id)));
     rejects(expected, || std::mem::forget(cx.f(id)));
 }
-
-// --- predicate operations ----
 
 #[test]
 fn malformed_sets_are_rejected() {

@@ -2,12 +2,14 @@
 //!
 //! A [`Context`] interns one bound algebra per registered backend and scalar
 //! sort and identifies it by an [`AlgebraId`]. A [`Predicate`] retains the
-//! context and its root in that algebra.
+//! context and its root in that algebra. A field binding records the algebra
+//! selected for a scalar record member.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::ast::Sorts;
+use crate::ast::{FuncDecl, Sorts};
 use crate::backend::{Algebra, Backend, BoolOp, Function};
 use crate::bdd::BddStore;
 use crate::scalar::ScalarSort;
@@ -26,6 +28,7 @@ pub struct AlgebraId {
 
 struct ContextData {
     sorts: Sorts,
+    fields: HashMap<FuncDecl, AlgebraId>,
     // Each entry records the backend index alongside its bound algebra.
     // Fields drop in declaration order, so the registry retains its
     // backends while the algebras drop.
@@ -172,7 +175,8 @@ impl Drop for Predicate {
     }
 }
 
-/// A shared owner of logical sorts, backends, and bound algebras.
+/// A shared owner of logical sorts, backends, bound algebras, and field
+/// bindings.
 ///
 /// Clones address the same storage and compare equal. Backend registration
 /// and new bindings require exclusive access so algebra resolution stays a
@@ -189,6 +193,7 @@ impl Context {
         Self {
             data: Arc::new(ContextData {
                 sorts: Sorts::default(),
+                fields: HashMap::new(),
                 algebras: Vec::new(),
                 backends: Vec::new(),
             }),
@@ -219,6 +224,34 @@ impl Context {
         data.backends.push((name, Arc::new(backend)));
     }
 
+    fn backend(&self, name: &str) -> usize {
+        self.data
+            .backends
+            .iter()
+            .position(|(n, _)| &**n == name)
+            .unwrap_or_else(|| panic!("backend {name:?} is not registered"))
+    }
+
+    fn bound(&self, backend: usize, sort: ScalarSort) -> Option<AlgebraId> {
+        self.data
+            .algebras
+            .iter()
+            .position(|(b, alg)| *b == backend && alg.sort() == sort)
+            .map(|index| AlgebraId {
+                context: self.sorts().id(),
+                index,
+            })
+    }
+
+    /// The existing algebra of the named backend over `sort`, if bound.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the backend is unregistered.
+    pub fn algebra(&self, name: &str, sort: ScalarSort) -> Option<AlgebraId> {
+        self.bound(self.backend(name), sort)
+    }
+
     /// Binds the named backend to `sort` or returns its existing algebra ID.
     ///
     /// # Panics
@@ -226,31 +259,64 @@ impl Context {
     /// Panics if the backend is unregistered, rejects `sort`, binds a
     /// different sort, or needs a new binding while the context is shared.
     pub fn bind(&mut self, name: &str, sort: ScalarSort) -> AlgebraId {
-        let backend = self
-            .data
-            .backends
-            .iter()
-            .position(|(n, _)| &**n == name)
-            .unwrap_or_else(|| panic!("backend {name:?} is not registered"));
-        let index = self
-            .data
-            .algebras
-            .iter()
-            .position(|(b, alg)| *b == backend && alg.sort() == sort)
-            .unwrap_or_else(|| {
-                let data = self.data_mut();
-                let alg = Arc::clone(&data.backends[backend].1)
-                    .bind(sort)
-                    .expect("backend must support the requested sort");
-                assert!(alg.sort() == sort, "backend bound a different scalar sort");
-                let index = data.algebras.len();
-                data.algebras.push((backend, alg));
-                index
-            });
+        let backend = self.backend(name);
+        if let Some(id) = self.bound(backend, sort) {
+            return id;
+        }
+        let data = self.data_mut();
+        let alg = Arc::clone(&data.backends[backend].1)
+            .bind(sort)
+            .expect("backend must support the requested sort");
+        assert!(alg.sort() == sort, "backend bound a different scalar sort");
+        let index = data.algebras.len();
+        data.algebras.push((backend, alg));
         AlgebraId {
-            context: self.data.sorts.id(),
+            context: data.sorts.id(),
             index,
         }
+    }
+
+    fn field_sort(&self, accessor: FuncDecl) -> ScalarSort {
+        accessor
+            .resolve(self.sorts())
+            .field_sort()
+            .expect("field must project a scalar record member")
+    }
+
+    /// The algebra bound to a scalar record member, if configured.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `accessor` belongs to another context or does not project a
+    /// scalar record member.
+    pub fn field(&self, accessor: FuncDecl) -> Option<AlgebraId> {
+        self.field_sort(accessor);
+        self.data.fields.get(&accessor).copied()
+    }
+
+    /// Binds a scalar record member to the named backend.
+    ///
+    /// Repeating the same selection returns the original algebra, including
+    /// while the context is shared.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the accessor is invalid as in [`Self::field`], the field is
+    /// bound to another backend, the context is shared when binding a new
+    /// field, or [`Self::bind`] rejects the backend or sort.
+    pub fn bind_field(&mut self, accessor: FuncDecl, name: &str) -> AlgebraId {
+        let sort = self.field_sort(accessor);
+        if let Some(&id) = self.data.fields.get(&accessor) {
+            let backend = self.data.algebras[id.index].0;
+            assert!(
+                &*self.data.backends[backend].0 == name,
+                "field is already bound to a different backend"
+            );
+            return id;
+        }
+        let id = self.bind(name, sort);
+        self.data_mut().fields.insert(accessor, id);
+        id
     }
 
     /// The bound algebra identified by `id`.

@@ -5,8 +5,9 @@
 //! declaring sort and the member position. Logical sorts describe values
 //! independently of their physical representation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::slice;
 use std::sync::{LazyLock, Mutex};
 
 use crate::idx;
@@ -136,6 +137,16 @@ pub struct FuncInfo {
     pub member: Option<usize>,
 }
 
+impl FuncInfo {
+    /// The scalar sort when this declaration projects a scalar record member.
+    pub fn field_sort(self) -> Option<ScalarSort> {
+        match (self.member, self.domain.kind, self.range.kind) {
+            (Some(_), SortKind::Record, SortKind::Scalar(scalar)) => Some(scalar),
+            _ => None,
+        }
+    }
+}
+
 /// A constructor or projection with a fixed logical signature.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FuncDecl {
@@ -212,6 +223,15 @@ impl Sorts {
 
     fn check_owner(&self, owner: u64) {
         assert!(owner == self.id, "declaration belongs to another store");
+    }
+
+    /// Checks that this store owns `sort`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `sort` belongs to another store.
+    pub fn check(&self, sort: Sort) {
+        self.check_owner(sort.owner);
     }
 
     fn intern(&self, node: Node, edges: &[SortId]) -> Sort {
@@ -325,7 +345,7 @@ impl Sorts {
         let mut edges = Vec::new();
         let mut len = Some(0_usize);
         for sort in sorts {
-            self.check_owner(sort.owner);
+            self.check(sort);
             len = len.and_then(|n| n.checked_add(sort.len));
             if sort.kind == SortKind::Product {
                 let state = self.state.read(());
@@ -364,7 +384,7 @@ impl Sorts {
         let len = members
             .iter()
             .try_fold(0_usize, |len, &(_, sort)| {
-                self.check_owner(sort.owner);
+                self.check(sort);
                 len.checked_add(sort.len)
             })
             .expect("scalar leaf count overflow");
@@ -379,7 +399,7 @@ impl Sorts {
     ///
     /// Panics if `sort` belongs to another store.
     pub fn members(&self, sort: Sort) -> Vec<Sort> {
-        self.check_owner(sort.owner);
+        self.check(sort);
         let state = self.state.read(());
         let node = state.node(sort.id);
         node.members(node.edges)
@@ -394,7 +414,7 @@ impl Sorts {
     ///
     /// Panics if `sort` belongs to another store or is not a record.
     pub fn constructor(&self, sort: Sort) -> FuncDecl {
-        self.check_owner(sort.owner);
+        self.check(sort);
         assert!(
             sort.kind == SortKind::Record,
             "constructor requires a record"
@@ -413,7 +433,7 @@ impl Sorts {
     /// Panics if `sort` belongs to another store, is a scalar, or has no
     /// member at `i`.
     pub fn project(&self, sort: Sort, i: usize) -> FuncDecl {
-        self.check_owner(sort.owner);
+        self.check(sort);
         assert!(
             !matches!(sort.kind, SortKind::Scalar(_)),
             "projection requires an aggregate sort"
@@ -429,6 +449,83 @@ impl Sorts {
             parent: sort.id,
             member: Some(i),
         }
+    }
+
+    /// Whether corresponding product components agree up to direct
+    /// conversions between a record and its declared arguments.
+    ///
+    /// Nested records remain nominal. An argumentless record may disappear
+    /// from one side between matching components. Two distinct argumentless
+    /// records cannot match by both disappearing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either sort belongs to another store.
+    pub fn coercible(&self, a: Sort, b: Sort) -> bool {
+        self.check(a);
+        self.check(b);
+        if a == b {
+            return true;
+        }
+        if a.len != b.len {
+            return false;
+        }
+
+        // Anonymous products are already flat, including each record's
+        // stored argument product. Borrow its components even when a record
+        // occurs many times in the input.
+        fn components<'a>(state: &'a State, id: &'a SortId) -> &'a [SortId] {
+            let node = state.node(*id);
+            if node.kind == SortKind::Product {
+                node.edges
+            } else {
+                slice::from_ref(id)
+            }
+        }
+
+        let state = self.state.read(());
+        let sides = [&a.id, &b.id].map(|id| components(&state, id));
+        // Search pairs of positions, remembering the side that last erased
+        // an argumentless record until the next match.
+        let mut seen = HashSet::new();
+        let mut stack = vec![([0, 0], None)];
+        while let Some((at, erased)) = stack.pop() {
+            if !seen.insert((at, erased)) {
+                continue;
+            }
+            if at == [sides[0].len(), sides[1].len()] {
+                return true;
+            }
+            if at[0] < sides[0].len() && sides[0].get(at[0]) == sides[1].get(at[1]) {
+                stack.push(([at[0] + 1, at[1] + 1], None));
+            }
+            for (i, parts) in sides.iter().enumerate() {
+                let Some(&id) = parts.get(at[i]) else {
+                    continue;
+                };
+                let node = state.node(id);
+                if node.kind != SortKind::Record {
+                    continue;
+                }
+                let args = components(
+                    &state,
+                    node.edges
+                        .last()
+                        .expect("a record must store its argument product"),
+                );
+                let mut next = at;
+                next[i] += 1;
+                if args.is_empty() {
+                    if erased != Some(1 - i) {
+                        stack.push((next, Some(i)));
+                    }
+                } else if sides[1 - i][at[1 - i]..].starts_with(args) {
+                    next[1 - i] += args.len();
+                    stack.push((next, None));
+                }
+            }
+        }
+        false
     }
 }
 
