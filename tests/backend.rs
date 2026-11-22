@@ -372,6 +372,23 @@ fn algebras(sort: ScalarSort, edges: usize) -> [Box<dyn Algebra>; 2] {
 }
 
 #[test]
+fn batched_release_consumes_one_reference_per_entry() {
+    for alg in algebras(BV4, 32) {
+        let p = alg.set(&[1]);
+        let q = alg.set(&[2]);
+        alg.inc_ref(p);
+        alg.dec_refs(&[p, Function::TRUE, q, p, Function::FALSE]);
+        // Probe both tokens before any allocation can reuse them.
+        for f in [p, q] {
+            rejects(
+                "cannot decrement an unreferenced or reclaimed DAG node",
+                || alg.dec_ref(f),
+            );
+        }
+    }
+}
+
+#[test]
 #[cfg(debug_assertions)]
 fn conditionals_check_all_three_input_roots() {
     for (alg, expected) in algebras(BV4, 32).into_iter().zip([

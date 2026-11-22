@@ -1223,8 +1223,20 @@ impl Algebra for BddAlgebra {
 
     /// Defers reclamation to growth-triggered collection.
     fn dec_ref(&self, f: Function) {
-        if !f.is_constant() {
-            self.store.read().dec_ref(f);
+        self.dec_refs(std::slice::from_ref(&f));
+    }
+
+    fn dec_refs(&self, roots: &[Function]) {
+        let mut roots = roots
+            .iter()
+            .copied()
+            .filter(|f| !f.is_constant())
+            .peekable();
+        if roots.peek().is_some() {
+            let state = self.store.read();
+            for f in roots {
+                state.dec_ref(f);
+            }
         }
     }
 
