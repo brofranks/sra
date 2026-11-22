@@ -288,6 +288,89 @@ fn foreign_records_and_declarations_are_rejected_at_each_entry_point() {
     });
 }
 
+// --- record and argument coercion ----
+
+#[test]
+fn records_convert_directly_to_their_declared_arguments() {
+    let cx = Context::empty();
+    let s = cx.sorts();
+    let (a, b) = (s.bv(8), s.bv(16));
+    let args = s.product([a, b]);
+    let fields = [("a", a), ("b", b)];
+    let pair = s.record("Pair", &fields);
+    let other = s.record("Other", &fields);
+    let nested = s.record("Nested", &[("p", pair)]);
+    for (left, right, expected) in [
+        (pair, pair, true),
+        (pair, args, true),
+        (other, args, true),
+        (pair, other, false),
+        (nested, pair, true),
+        (nested, args, false),
+        (s.product([a, pair]), s.product([a, a, b]), true),
+        (pair, s.product([b, a]), false),
+        (pair, a, false),
+        (s.bool(), s.bv(1), false),
+        (s.symbol("X"), s.symbol("Y"), false),
+    ] {
+        assert_eq!(s.coercible(left, right), expected);
+        assert_eq!(s.coercible(right, left), expected);
+    }
+}
+
+#[test]
+fn zero_width_record_conversion_is_independent_of_component_order() {
+    let cx = Context::empty();
+    let s = cx.sorts();
+    let a = s.bv(8);
+    let e = s.record("E", &[]);
+    let o = s.record("O", &[]);
+    let w = s.record("W", &[("e", e)]);
+    // An argumentless record disappears against nothing, but two different
+    // ones never both disappear between the same corresponding components.
+    for (left, right, expected) in [
+        (s.product([e, o]), o, true),
+        (s.product([o, e]), o, true),
+        (s.product([e, w]), w, true),
+        (s.product([e, o]), s.unit(), true),
+        (s.product([e, a]), s.product([a, o]), true),
+        (s.product([e, a]), s.product([o, a]), false),
+        (e, o, false),
+        (w, s.unit(), false),
+        (s.product([w, a]), s.product([e, a]), true),
+    ] {
+        assert_eq!(s.coercible(left, right), expected);
+        assert_eq!(s.coercible(right, left), expected);
+    }
+}
+
+#[test]
+fn repeated_records_check_the_final_scalar_after_the_shared_prefix() {
+    let cx = Context::empty();
+    let s = cx.sorts();
+    let boolean = s.bool();
+    let (members, repeats) = if cfg!(miri) { (32, 64) } else { (1024, 2048) };
+    let record = s.record("Repeated", &vec![("x", boolean); members]);
+    let product = |last| s.product(std::iter::repeat_n(record, repeats).chain([last]));
+    let a = product(boolean);
+    let b = product(s.bv(1));
+    assert!(!s.coercible(a, b));
+    assert!(!s.coercible(b, a));
+}
+
+#[test]
+fn coercion_checks_both_owners_before_comparing_sorts() {
+    let cx = Context::empty();
+    let s = cx.sorts();
+    let other = Context::empty();
+    let foreign = other.sorts().bool();
+    for (a, b) in [(foreign, foreign), (s.unit(), foreign), (foreign, s.unit())] {
+        rejects("declaration belongs to another store", || {
+            s.coercible(a, b);
+        });
+    }
+}
+
 // --- growth and concurrency ----
 
 #[test]
