@@ -1,4 +1,4 @@
-//! Shared ownership of scalar backends, algebras, and predicates.
+//! Shared ownership of logical sorts, backends, algebras, and predicates.
 //!
 //! A [`Context`] interns one bound algebra per registered backend and scalar
 //! sort and identifies it by an [`AlgebraId`]. A [`Predicate`] retains the
@@ -7,11 +7,11 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::ast::Sorts;
 use crate::backend::{Algebra, Backend, BoolOp, Function};
 use crate::bdd::BddStore;
 use crate::scalar::ScalarSort;
 use crate::sparse::SparseStore;
-use crate::util;
 use crate::util::count::Count;
 
 /// The ID of a backend binding to one scalar sort within a context.
@@ -25,7 +25,7 @@ pub struct AlgebraId {
 }
 
 struct ContextData {
-    id: u64,
+    sorts: Sorts,
     // Each entry records the backend index alongside its bound algebra.
     // Fields drop in declaration order, so the registry retains its
     // backends while the algebras drop.
@@ -172,7 +172,7 @@ impl Drop for Predicate {
     }
 }
 
-/// A shared owner of backends and their bound algebras.
+/// A shared owner of logical sorts, backends, and bound algebras.
 ///
 /// Clones address the same storage and compare equal. Backend registration
 /// and new bindings require exclusive access so algebra resolution stays a
@@ -188,11 +188,16 @@ impl Context {
     pub fn empty() -> Self {
         Self {
             data: Arc::new(ContextData {
-                id: util::fresh_id(),
+                sorts: Sorts::default(),
                 algebras: Vec::new(),
                 backends: Vec::new(),
             }),
         }
+    }
+
+    /// The logical declaration store shared by this context and its clones.
+    pub fn sorts(&self) -> &Sorts {
+        &self.data.sorts
     }
 
     fn data_mut(&mut self) -> &mut ContextData {
@@ -243,7 +248,7 @@ impl Context {
                 index
             });
         AlgebraId {
-            context: self.data.id,
+            context: self.data.sorts.id(),
             index,
         }
     }
@@ -256,7 +261,7 @@ impl Context {
     #[inline(always)]
     pub fn resolve(&self, id: AlgebraId) -> &dyn Algebra {
         assert!(
-            id.context == self.data.id,
+            id.context == self.data.sorts.id(),
             "algebra belongs to another context"
         );
         &*self.data.algebras[id.index].1
@@ -326,7 +331,7 @@ impl Context {
 impl fmt::Debug for Context {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Context")
-            .field("id", &self.data.id)
+            .field("id", &self.data.sorts.id())
             .finish_non_exhaustive()
     }
 }
@@ -344,7 +349,7 @@ impl Default for Context {
 
 impl PartialEq for Context {
     fn eq(&self, other: &Self) -> bool {
-        self.data.id == other.data.id
+        Arc::ptr_eq(&self.data, &other.data)
     }
 }
 
