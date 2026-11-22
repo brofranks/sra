@@ -101,6 +101,7 @@ fn zero_has_one_representation() {
     assert_eq!(&Count::from(7) * &Count::ZERO, Count::ZERO);
     assert_eq!(&Count::from(u64::MAX) * &Count::ZERO, Count::ZERO);
     assert_eq!(Count::ZERO << 200, Count::ZERO);
+    assert_eq!(Count::ZERO.shift(u64::MAX), Count::ZERO);
     assert_eq!(Count::ZERO.to_string(), "0");
 }
 

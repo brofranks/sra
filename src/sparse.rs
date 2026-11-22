@@ -555,8 +555,20 @@ impl<L: Layout> Algebra for SparseAlgebra<L> {
     ///
     /// Maintenance can reclaim the map once its last reference is released.
     fn dec_ref(&self, f: Function) {
-        if !f.is_constant() {
-            self.store.shared.read(self.store.threads).dec_ref(f);
+        self.dec_refs(std::slice::from_ref(&f));
+    }
+
+    fn dec_refs(&self, roots: &[Function]) {
+        let mut roots = roots
+            .iter()
+            .copied()
+            .filter(|f| !f.is_constant())
+            .peekable();
+        if roots.peek().is_some() {
+            let state = self.store.shared.read(self.store.threads);
+            for f in roots {
+                state.dec_ref(f);
+            }
         }
     }
 
