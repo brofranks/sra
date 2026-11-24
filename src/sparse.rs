@@ -315,7 +315,14 @@ fn number<'a, T: Copy + Eq + Hash>(
     classes: &'a mut Map<T, u32>,
     labels: &'a mut Vec<T>,
 ) -> impl FnMut(T) -> u32 + 'a {
-    classes.clear();
+    // Clearing costs time proportional to capacity. Releasing a table that
+    // an earlier, larger numbering left oversized bounds each clear by a
+    // constant factor of the previous numbering's insertions.
+    if classes.capacity() > 4 * classes.len().max(16) {
+        *classes = Map::default();
+    } else {
+        classes.clear();
+    }
     let mut class_of = move |label| {
         let next = classes.len() as u32;
         *classes.entry(label).or_insert_with(|| {

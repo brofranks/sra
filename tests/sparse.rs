@@ -749,6 +749,32 @@ fn values_reuse_buffers_and_number_classes_from_the_label_suffix() {
 }
 
 #[test]
+fn values_release_oversized_class_storage_after_a_small_build() {
+    let alg = bind(&roomy(), ScalarSort::bv(8));
+    let mut scratch = Values::default();
+    let keys: Vec<_> = (1_u64..=128).collect();
+    let case_labels: Vec<_> = (1_u32..=128).collect();
+    let mut labels = Vec::new();
+    let f = alg.values(0, &keys, &case_labels, &mut labels, &mut scratch);
+    alg.dec_ref(f);
+    assert_eq!(labels.len(), 129);
+    let large = scratch.classes.capacity();
+
+    // The first small build leaves a small entry count for the next reset.
+    for label in [7, 8] {
+        labels.clear();
+        let f = alg.values(0, &[1], &[label], &mut labels, &mut scratch);
+        assert_eq!(labels, [0, label]);
+        assert_eq!([0, 1, 2].map(|x| alg.evaluate(f, &[x])), [0, 1, 0]);
+        alg.dec_ref(f);
+    }
+    assert!(
+        scratch.classes.capacity() < large,
+        "small builds must release oversized class storage"
+    );
+}
+
+#[test]
 fn adjacent_point_labels_share_a_boundary_across_words() {
     let alg = bind(&roomy(), ScalarSort::bv(65));
     let keys = [[u64::MAX, 0], [0, 1], [u64::MAX, 1]];
